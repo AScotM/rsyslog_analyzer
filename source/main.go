@@ -60,12 +60,35 @@ var (
 	}
 
 	allowedDirs = []string{"/var/log", "/tmp/logs", "/opt/logs", "/var/log/journal", "/run/log"}
-
-	regexPool = sync.Pool{
-		New: func() interface{} {
-			return make(map[string]string)
-		},
-	}
+	
+	traditionalPattern = regexp.MustCompile(
+		`^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+` +
+			`(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+` +
+			`(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\/]+)` +
+			`(?:\[(?P<pid>\d+)\])?:\s*(?P<message>.+)$`)
+	
+	traditionalSimplePattern = regexp.MustCompile(
+		`^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+` +
+			`(?P<time>\d{2}:\d{2}:\d{2})\s+` +
+			`(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\/]+):\s*` +
+			`(?P<message>.+)$`)
+	
+	iso8601Pattern = regexp.MustCompile(
+		`^(?P<timestamp>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?(?:\s+[+-]\d{4})?)\s+` +
+			`(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\/]+)(?:\[(?P<pid>\d+)\])?:\s*` +
+			`(?P<message>.+)$`)
+	
+	journaldPattern = regexp.MustCompile(
+		`^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+\d{4})\s+` +
+			`(?P<host>[\w\-.]+)\s+(?P<service>\w+)\[(?P<pid>\d+)\]:\s*` +
+			`(?P<message>.+)$`)
+	
+	rainerscriptPattern = regexp.MustCompile(
+		`^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[\d+-:]+)\s+` +
+			`(?P<host>\S+)\s+` +
+			`(?P<service>\S+?)(?:\[(?P<pid>\d+)\])?:?\s+` +
+			`(?:\[(?P<level>\w+)\]\s+)?` +
+			`(?P<message>.+)$`)
 )
 
 type SecurityError struct {
@@ -174,43 +197,28 @@ type PatternInfo struct {
 }
 
 func (r *RSyslogInfo) GetRecommendedPatterns() []PatternInfo {
-	patterns := []PatternInfo{}
-
-	patterns = append(patterns, PatternInfo{
-		Pattern: regexp.MustCompile(
-			`^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+` +
-				`(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+` +
-				`(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\/]+)` +
-				`(?:\[(?P<pid>\d+)\])?:\s*(?P<message>.+)$`),
-		Type:        "traditional",
-		Description: "Basic syslog format",
-	})
-
-	patterns = append(patterns, PatternInfo{
-		Pattern: regexp.MustCompile(
-			`^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+` +
-				`(?P<time>\d{2}:\d{2}:\d{2})\s+` +
-				`(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\/]+):\s*` +
-				`(?P<message>.+)$`),
-		Type:        "traditional_simple",
-		Description: "Simple syslog format",
-	})
+	patterns := []PatternInfo{
+		{
+			Pattern:     traditionalPattern,
+			Type:        "traditional",
+			Description: "Basic syslog format",
+		},
+		{
+			Pattern:     traditionalSimplePattern,
+			Type:        "traditional_simple",
+			Description: "Simple syslog format",
+		},
+	}
 
 	if r.Version != "" && r.versionCompare(r.Version, "8.0") >= 0 {
 		patterns = append(patterns, PatternInfo{
-			Pattern: regexp.MustCompile(
-				`^(?P<timestamp>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?(?:\s+[+-]\d{4})?)\s+` +
-					`(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\/]+)(?:\[(?P<pid>\d+)\])?:\s*` +
-					`(?P<message>.+)$`),
+			Pattern:     iso8601Pattern,
 			Type:        "iso8601",
 			Description: "ISO 8601 timestamp format",
 		})
 
 		patterns = append(patterns, PatternInfo{
-			Pattern: regexp.MustCompile(
-				`^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+\d{4})\s+` +
-					`(?P<host>[\w\-.]+)\s+(?P<service>\w+)\[(?P<pid>\d+)\]:\s*` +
-					`(?P<message>.+)$`),
+			Pattern:     journaldPattern,
 			Type:        "journald",
 			Description: "Journald-style format",
 		})
@@ -218,12 +226,7 @@ func (r *RSyslogInfo) GetRecommendedPatterns() []PatternInfo {
 
 	if r.Features["FEATURE_REGEXP"] {
 		patterns = append(patterns, PatternInfo{
-			Pattern: regexp.MustCompile(
-				`^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[\d+-:]+)\s+` +
-					`(?P<host>\S+)\s+` +
-					`(?P<service>\S+?)(?:\[(?P<pid>\d+)\])?:?\s+` +
-					`(?:\[(?P<level>\w+)\]\s+)?` +
-					`(?P<message>.+)$`),
+			Pattern:     rainerscriptPattern,
 			Type:        "rainerscript_enhanced",
 			Description: "RainerScript enhanced format",
 		})
@@ -350,6 +353,10 @@ func (c *AnalyzerConfig) Validate() error {
 }
 
 func (c *AnalyzerConfig) FromFile(configPath string) error {
+	if strings.Contains(configPath, "..") || strings.ContainsAny(configPath, "/\\") {
+		return SecurityError{Message: "invalid config file path"}
+	}
+	
 	content, err := os.ReadFile(configPath)
 	if err != nil {
 		return fmt.Errorf("failed to read config file: %w", err)
@@ -527,10 +534,10 @@ func (b *BoundedLogStorage) Add(entry *LogEntry) {
 
 	b.entries[b.tail] = entry
 	b.tail = (b.tail + 1) % b.maxSize
+	
 	if b.size < b.maxSize {
 		b.size++
 	} else {
-		b.entries[b.head] = nil
 		b.head = (b.head + 1) % b.maxSize
 	}
 }
@@ -612,9 +619,12 @@ type xzReader struct {
 
 func (x *xzReader) Close() error {
 	if x.cmd.Process != nil {
-		x.cmd.Process.Kill()
+		if err := x.cmd.Process.Signal(os.Interrupt); err != nil {
+			x.cmd.Process.Kill()
+		}
 	}
-	if err := x.cmd.Wait(); err != nil {
+	err := x.cmd.Wait()
+	if err != nil {
 		return fmt.Errorf("xz command failed: %w", err)
 	}
 	return nil
@@ -674,28 +684,17 @@ func (l *LogParser) compilePatterns() []PatternInfo {
 
 	return []PatternInfo{
 		{
-			Pattern: regexp.MustCompile(
-				`^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+` +
-					`(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+` +
-					`(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\/]+)` +
-					`(?:\[(?P<pid>\d+)\])?:\s*(?P<message>.+)$`),
+			Pattern:     traditionalPattern,
 			Type:        "traditional",
 			Description: "Basic syslog format",
 		},
 		{
-			Pattern: regexp.MustCompile(
-				`^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+` +
-					`(?P<time>\d{2}:\d{2}:\d{2})\s+` +
-					`(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\/]+):\s*` +
-					`(?P<message>.+)$`),
+			Pattern:     traditionalSimplePattern,
 			Type:        "traditional_simple",
 			Description: "Simple syslog format",
 		},
 		{
-			Pattern: regexp.MustCompile(
-				`^(?P<timestamp>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?(?:\s+[+-]\d{4})?)\s+` +
-					`(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\/]+)(?:\[(?P<pid>\d+)\])?:\s*` +
-					`(?P<message>.+)$`),
+			Pattern:     iso8601Pattern,
 			Type:        "iso8601",
 			Description: "ISO 8601 timestamp format",
 		},
@@ -736,12 +735,7 @@ func (l *LogParser) ParseLine(line string, now, cutoffDate time.Time) (*LogEntry
 			continue
 		}
 
-		groupDict := regexPool.Get().(map[string]string)
-		for k := range groupDict {
-			delete(groupDict, k)
-		}
-		defer regexPool.Put(groupDict)
-
+		groupDict := make(map[string]string)
 		for i, name := range patternInfo.Pattern.SubexpNames() {
 			if i > 0 && i <= len(match) && name != "" {
 				groupDict[name] = match[i]
@@ -800,16 +794,10 @@ func (l *LogParser) extractTimestamp(groupDict map[string]string, patternType st
 		"Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
 	}[month]; exists {
 		currentMonth := int(now.Month())
-		if monthNum > currentMonth {
+		if monthNum > currentMonth && monthNum-currentMonth > 6 {
 			year--
-		}
-		for i := 1; i <= MaxMonthDetection; i++ {
-			testDate := time.Date(year, time.Month(monthNum), 1, 0, 0, 0, 0, time.Local)
-			if testDate.After(now.AddDate(0, i, 0)) {
-				year--
-			} else if testDate.Before(now.AddDate(0, -i, 0)) {
-				year++
-			}
+		} else if monthNum < currentMonth && currentMonth-monthNum > 6 {
+			year++
 		}
 	}
 
@@ -879,7 +867,7 @@ type RSyslogAnalyzer struct {
 	Plugins         []AnalysisPlugin
 	ProcessedLines  int64
 	ParsedEntries   int64
-	MemoryWarning   bool
+	memoryWarning   int32
 	storage         *BoundedLogStorage
 }
 
@@ -907,6 +895,7 @@ func NewRSyslogAnalyzer(logFile string, config *AnalyzerConfig) (*RSyslogAnalyze
 		AnalysisResults: NewAnalysisResults(),
 		Plugins:         []AnalysisPlugin{NewErrorClusterPlugin()},
 		storage:         NewBoundedLogStorage(config.MaxMemoryEntries),
+		memoryWarning:   0,
 	}
 
 	if analyzer.LogFile == "" {
@@ -1014,7 +1003,10 @@ func (r *RSyslogAnalyzer) isSafePath(path string) bool {
 		if strings.HasPrefix(resolved, allowed) {
 			rel, err := filepath.Rel(allowed, resolved)
 			if err == nil && !strings.Contains(rel, "..") {
-				return true
+				cleanRel := filepath.Clean(rel)
+				if cleanRel == rel {
+					return true
+				}
 			}
 		}
 	}
@@ -1024,6 +1016,10 @@ func (r *RSyslogAnalyzer) isSafePath(path string) bool {
 }
 
 func (r *RSyslogAnalyzer) openLogFile(filePath string) (io.ReadCloser, error) {
+	if strings.Contains(filePath, "..") || strings.ContainsAny(filePath, "$`") {
+		return nil, SecurityError{Message: fmt.Sprintf("potentially dangerous path: %s", filePath)}
+	}
+
 	resolvedPath, err := filepath.EvalSymlinks(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve symlinks: %w", err)
@@ -1081,11 +1077,6 @@ func (r *RSyslogAnalyzer) openLogFile(filePath string) (io.ReadCloser, error) {
 			Closer: file,
 		}, nil
 	} else if strings.HasSuffix(filePath, ".xz") {
-		if strings.Contains(resolvedPath, "..") || strings.Contains(resolvedPath, "$") || strings.Contains(resolvedPath, "`") {
-			file.Close()
-			return nil, SecurityError{Message: "potentially dangerous path for xz command"}
-		}
-
 		cmd := exec.Command("xz", "-dc", resolvedPath)
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
@@ -1125,9 +1116,26 @@ func (r *RSyslogAnalyzer) LoadLogsWithContext(ctx context.Context) error {
 		defer fmt.Println(" done")
 	}
 
-	reader, err := r.openLogFile(r.LogFile)
-	if err != nil {
-		return fmt.Errorf("cannot read log file: %w", err)
+	type openResult struct {
+		reader io.ReadCloser
+		err    error
+	}
+	
+	resultCh := make(chan openResult, 1)
+	go func() {
+		reader, err := r.openLogFile(r.LogFile)
+		resultCh <- openResult{reader, err}
+	}()
+
+	var reader io.ReadCloser
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case res := <-resultCh:
+		if res.err != nil {
+			return fmt.Errorf("cannot read log file: %w", res.err)
+		}
+		reader = res.reader
 	}
 	defer reader.Close()
 
@@ -1178,9 +1186,8 @@ func (r *RSyslogAnalyzer) LoadLogsWithContext(ctx context.Context) error {
 
 func (r *RSyslogAnalyzer) processEntry(entry *LogEntry) {
 	if r.storage.Size() >= r.Config.MaxMemoryEntries {
-		if !r.MemoryWarning {
+		if atomic.CompareAndSwapInt32(&r.memoryWarning, 0, 1) {
 			slog.Warn("memory limit reached", "limit", r.Config.MaxMemoryEntries)
-			r.MemoryWarning = true
 		}
 		return
 	}
@@ -1602,6 +1609,10 @@ func (r *RSyslogAnalyzer) displayTextSummary() {
 }
 
 func (r *RSyslogAnalyzer) ExportToJSON(filename string) error {
+	if strings.Contains(filename, "..") || strings.ContainsAny(filename, "/\\") {
+		return SecurityError{Message: "invalid filename for JSON export"}
+	}
+
 	parserInfo := r.Parser.GetParserInfo()
 
 	exportData := map[string]interface{}{
@@ -1642,6 +1653,10 @@ func (r *RSyslogAnalyzer) ExportToJSON(filename string) error {
 }
 
 func (r *RSyslogAnalyzer) ExportToCSV(filename string) error {
+	if strings.Contains(filename, "..") || strings.ContainsAny(filename, "/\\") {
+		return SecurityError{Message: "invalid filename for CSV export"}
+	}
+
 	file, err := os.Create(filename)
 	if err != nil {
 		return fmt.Errorf("failed to create file: %w", err)
