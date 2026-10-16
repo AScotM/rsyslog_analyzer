@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -21,7 +22,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -797,7 +800,7 @@ func (l *LogParser) ParseLine(line string, now, cutoffDate time.Time) (*LogEntry
 		defer regexPool.Put(groupDict)
 
 		for i, name := range patternInfo.Pattern.SubexpNames() {
-			if i > 0 && i <= len(match) && name != "" {
+			if i > 0 && i < len(match) && name != "" {
 				groupDict[name] = match[i]
 			}
 		}
@@ -1451,8 +1454,9 @@ func (r *RSyslogAnalyzer) displayLogEntry(log *LogEntry, prefix string, isLast b
 		messageLines = wrapText(log.Message, wrapWidth)
 		truncation = ""
 	} else {
-		if len(log.Message) > r.Config.TruncateLength {
-			messageLines = []string{log.Message[:r.Config.TruncateLength]}
+		if utf8.RuneCountInString(log.Message) > r.Config.TruncateLength {
+			runes := []rune(log.Message)
+			messageLines = []string{string(runes[:r.Config.TruncateLength])}
 			truncation = "..."
 		} else {
 			messageLines = []string{log.Message}
@@ -1662,7 +1666,7 @@ func (r *RSyslogAnalyzer) ExportToJSON(filename string) error {
 		return fmt.Errorf("failed to marshal JSON: %w", err)
 	}
 
-	if err := os.WriteFile(filename, content, 0644); err != nil {
+	if err := os.WriteFile(filename, content, 0600); err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 
@@ -1670,7 +1674,7 @@ func (r *RSyslogAnalyzer) ExportToJSON(filename string) error {
 }
 
 func (r *RSyslogAnalyzer) ExportToCSV(filename string) error {
-	file, err := os.Create(filename)
+	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to create file: %w", err)
 	}
@@ -1698,6 +1702,10 @@ func (r *RSyslogAnalyzer) ExportToCSV(filename string) error {
 		}
 	}
 
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return fmt.Errorf("CSV flush failed: %w", err)
+	}
 	return nil
 }
 
@@ -1754,6 +1762,255 @@ func (r *RSyslogAnalyzer) FilterLogs(servicePattern, level, messageContains stri
 	return filtered
 }
 
+type ExtendedStats struct {
+	TotalRetained   int            `json:"total_retained"`
+	ErrorsRetained  int            `json:"errors_retained"`
+	WarningRetained int            `json:"warning_retained"`
+	Hosts           map[string]int `json:"hosts"`
+	Services        map[string]int `json:"services"`
+	Levels          map[string]int `json:"levels"`
+	Days            map[string]int `json:"days"`
+	Hours           map[string]int `json:"hours"`
+	Weekdays        map[string]int `json:"weekdays"`
+	ErrorServices   map[string]int `json:"error_services"`
+	MessageLengths  map[string]int `json:"message_lengths"`
+	PeakHour        string         `json:"peak_hour"`
+	PeakCount       int            `json:"peak_count"`
+	Earliest        string         `json:"earliest"`
+	Latest          string         `json:"latest"`
+}
+
+func newExtendedStats() ExtendedStats {
+	return ExtendedStats{
+		Hosts:          make(map[string]int),
+		Services:       make(map[string]int),
+		Levels:         make(map[string]int),
+		Days:           make(map[string]int),
+		Hours:          make(map[string]int),
+		Weekdays:       make(map[string]int),
+		ErrorServices:  make(map[string]int),
+		MessageLengths: make(map[string]int),
+	}
+}
+
+func (s *ExtendedStats) Record(e *LogEntry) {
+	s.TotalRetained++
+	s.Hosts[e.Host]++
+	s.Services[e.Service]++
+	level := strings.ToUpper(e.Level)
+	if level == "" {
+		level = "UNKNOWN"
+	}
+	s.Levels[level]++
+	s.Days[e.Timestamp.Format("2006-01-02")]++
+	hour := e.Timestamp.Format("2006-01-02 15:00")
+	s.Hours[hour]++
+	s.Weekdays[e.Timestamp.Weekday().String()]++
+	if s.Hours[hour] > s.PeakCount {
+		s.PeakHour = hour
+		s.PeakCount = s.Hours[hour]
+	}
+	if e.IsError() {
+		s.ErrorsRetained++
+		s.ErrorServices[e.Service]++
+	}
+	if level == "WARN" || level == "WARNING" {
+		s.WarningRetained++
+	}
+	length := utf8.RuneCountInString(e.Message)
+	switch {
+	case length < 40:
+		s.MessageLengths["0-39"]++
+	case length < 80:
+		s.MessageLengths["40-79"]++
+	case length < 160:
+		s.MessageLengths["80-159"]++
+	case length < 320:
+		s.MessageLengths["160-319"]++
+	default:
+		s.MessageLengths["320+"]++
+	}
+	timestamp := e.Timestamp.Format(time.RFC3339Nano)
+	if s.Earliest == "" || timestamp < s.Earliest {
+		s.Earliest = timestamp
+	}
+	if s.Latest == "" || timestamp > s.Latest {
+		s.Latest = timestamp
+	}
+}
+
+func (r *RSyslogAnalyzer) ExtendedStatistics() ExtendedStats {
+	stats := newExtendedStats()
+	for _, e := range r.storage.GetAll() {
+		stats.Record(e)
+	}
+	return stats
+}
+
+type Finding struct {
+	Rule      string `json:"rule"`
+	Category  string `json:"category"`
+	Severity  string `json:"severity"`
+	Timestamp string `json:"timestamp"`
+	Host      string `json:"host"`
+	Service   string `json:"service"`
+	Message   string `json:"message"`
+}
+
+type Rule struct {
+	Name     string
+	Category string
+	Severity string
+	Pattern  *regexp.Regexp
+}
+
+func securityRules() []Rule {
+	specifications := []struct{ name, category, severity, pattern string }{
+		{"ssh-authentication-failure", "authentication", "medium", `(?i)(failed password|authentication failure|invalid user)`},
+		{"ssh-root-login", "authentication", "high", `(?i)(accepted (password|publickey) for root)`},
+		{"sudo-denied", "privilege", "medium", `(?i)(not in the sudoers|sudo:.*authentication failure)`},
+		{"selinux-denial", "selinux", "medium", `(?i)(avc:\s*denied|selinux.*denied)`},
+		{"oom-killer", "memory", "high", `(?i)(out of memory: kill process|oom-killer|killed process \d+)`},
+		{"kernel-panic", "kernel", "critical", `(?i)(kernel panic|not syncing)`},
+		{"disk-io-error", "storage", "high", `(?i)(i/o error|blk_update_request|buffer i/o error)`},
+		{"filesystem-readonly", "storage", "high", `(?i)(remounting filesystem read-only|read-only file system)`},
+		{"filesystem-corruption", "storage", "critical", `(?i)(filesystem corruption|metadata checksum error|ext4-fs error|xfs.*corrupt)`},
+		{"systemd-unit-failure", "service", "medium", `(?i)(failed to start|entered failed state|unit .* failed)`},
+		{"network-link-down", "network", "low", `(?i)(link is down|carrier lost|network is unreachable)`},
+		{"dns-resolution-failure", "network", "medium", `(?i)(temporary failure in name resolution|could not resolve|dns.*timed out)`},
+		{"tls-certificate-expired", "security", "high", `(?i)(certificate has expired|certificate expired|x509: certificate)`},
+		{"time-synchronization-failure", "time", "medium", `(?i)(ntp.*unsynchron|chronyd.*not synchron)`},
+		{"database-connection-refused", "database", "medium", `(?i)(database.*connection refused|mysql.*connection refused|mariadb.*connection refused)`},
+		{"container-runtime-failure", "container", "medium", `(?i)(podman.*failed|conmon.*failed|container.*exited with)`},
+		{"audit-backlog", "audit", "high", `(?i)(audit.*backlog limit|audit.*lost events)`},
+		{"firewall-block", "firewall", "low", `(?i)(firewalld.*reject|iptables.*drop|nftables.*drop)`},
+		{"hardware-machine-check", "hardware", "critical", `(?i)(machine check exception|hardware error|mce:.*error)`},
+		{"watchdog-timeout", "kernel", "high", `(?i)(watchdog.*timeout|soft lockup|hard lockup)`},
+	}
+	rules := make([]Rule, 0, len(specifications))
+	for _, spec := range specifications {
+		rules = append(rules, Rule{spec.name, spec.category, spec.severity, regexp.MustCompile(spec.pattern)})
+	}
+	return rules
+}
+
+func (r *RSyslogAnalyzer) DetectFindings(limit int) []Finding {
+	if limit <= 0 {
+		return nil
+	}
+	rules := securityRules()
+	findings := make([]Finding, 0)
+	for _, entry := range r.storage.GetAll() {
+		for _, rule := range rules {
+			if !rule.Pattern.MatchString(entry.Message) {
+				continue
+			}
+			findings = append(findings, Finding{
+				Rule:      rule.Name,
+				Category:  rule.Category,
+				Severity:  rule.Severity,
+				Timestamp: entry.Timestamp.Format(time.RFC3339Nano),
+				Host:      entry.Host,
+				Service:   entry.Service,
+				Message:   entry.Message,
+			})
+			if len(findings) >= limit {
+				return findings
+			}
+		}
+	}
+	return findings
+}
+
+func sortedCounts(counts map[string]int) []string {
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if counts[keys[i]] == counts[keys[j]] {
+			return keys[i] < keys[j]
+		}
+		return counts[keys[i]] > counts[keys[j]]
+	})
+	return keys
+}
+
+func (r *RSyslogAnalyzer) DisplayExtendedStatistics() {
+	stats := r.ExtendedStatistics()
+	fmt.Println("\nExtended Retained-Entry Statistics")
+	fmt.Printf("Retained: %d, errors: %d, warnings: %d\n", stats.TotalRetained, stats.ErrorsRetained, stats.WarningRetained)
+	fmt.Printf("Earliest: %s\nLatest: %s\n", stats.Earliest, stats.Latest)
+	fmt.Printf("Peak hour: %s (%d entries)\n", stats.PeakHour, stats.PeakCount)
+	groups := []struct {
+		name   string
+		counts map[string]int
+	}{
+		{"Hosts", stats.Hosts},
+		{"Services", stats.Services},
+		{"Levels", stats.Levels},
+		{"Error Services", stats.ErrorServices},
+		{"Weekdays", stats.Weekdays},
+		{"Message Lengths", stats.MessageLengths},
+	}
+	for _, group := range groups {
+		fmt.Printf("\n%s\n", group.name)
+		keys := sortedCounts(group.counts)
+		if len(keys) > 15 {
+			keys = keys[:15]
+		}
+		for _, key := range keys {
+			fmt.Printf("  %-30s %d\n", key, group.counts[key])
+		}
+	}
+}
+
+func (r *RSyslogAnalyzer) DisplayFindings(limit int) {
+	findings := r.DetectFindings(limit)
+	fmt.Printf("\nRule-based findings (up to %d, retained entries only): %d\n", limit, len(findings))
+	for _, f := range findings {
+		fmt.Printf("%s %-9s %-26s %-20s %s\n", f.Timestamp, f.Severity, f.Rule, f.Service, f.Message)
+	}
+}
+
+func (r *RSyslogAnalyzer) ExportExtendedJSON(filename string, maxFindings int) error {
+	payload := struct {
+		GeneratedAt string        `json:"generated_at"`
+		LogFile     string        `json:"log_file"`
+		Processed   int64         `json:"processed_lines"`
+		Parsed      int64         `json:"parsed_entries"`
+		Statistics  ExtendedStats `json:"statistics"`
+		Findings    []Finding     `json:"findings"`
+	}{
+		GeneratedAt: time.Now().Format(time.RFC3339Nano),
+		LogFile:     r.LogFile,
+		Processed:   atomic.LoadInt64(&r.ProcessedLines),
+		Parsed:      atomic.LoadInt64(&r.ParsedEntries),
+		Statistics:  r.ExtendedStatistics(),
+		Findings:    r.DetectFindings(maxFindings),
+	}
+	output, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filename, append(output, '\n'), 0600)
+}
+
+func (r *RSyslogAnalyzer) ExportNDJSON(filename string) error {
+	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(file)
+	for _, entry := range r.storage.GetAll() {
+		if err := encoder.Encode(entry); err != nil {
+			file.Close()
+			return err
+		}
+	}
+	return file.Close()
+}
+
 func main() {
 	var (
 		logFile            = flag.String("log-file", "", "Path to the syslog file (overrides default search).")
@@ -1779,6 +2036,11 @@ func main() {
 		noRSyslogDetection = flag.Bool("no-rsyslog-detection", false, "Disable rsyslog capability detection.")
 		configFile         = flag.String("config-file", "", "Load configuration from JSON file.")
 		showVersion        = flag.Bool("version", false, "Show version information.")
+		extended           = flag.Bool("extended-stats", false, "Show extended retained-entry statistics.")
+		findings           = flag.Bool("findings", false, "Show rule-based diagnostic findings.")
+		maxFindings        = flag.Int("max-findings", 100, "Maximum number of findings to report.")
+		exportExtended     = flag.String("export-extended", "", "Export extended analysis JSON.")
+		exportNDJSON       = flag.String("export-ndjson", "", "Export retained entries as NDJSON.")
 	)
 
 	flag.Parse()
@@ -1787,7 +2049,7 @@ func main() {
 	slog.SetDefault(logger)
 
 	if *showVersion {
-		fmt.Println("RSyslogAnalyzer 4.0.0")
+		fmt.Println("RSyslogAnalyzer 5.0.0")
 		return
 	}
 
@@ -1811,6 +2073,7 @@ func main() {
 		config.UseRSyslogDetection = !*noRSyslogDetection
 	}
 
+	config.EnableAnalysis = config.EnableAnalysis || *summary || *export != ""
 	if err := config.Validate(); err != nil {
 		slog.Error("invalid configuration", "error", err)
 		os.Exit(1)
@@ -1832,7 +2095,7 @@ func main() {
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	if err := analyzer.LoadLogsWithContext(ctx); err != nil {
@@ -1895,6 +2158,24 @@ func main() {
 		}
 	}
 
+	if *extended {
+		analyzer.DisplayExtendedStatistics()
+	}
+	if *findings {
+		analyzer.DisplayFindings(*maxFindings)
+	}
+	if *exportExtended != "" {
+		if err := analyzer.ExportExtendedJSON(*exportExtended, *maxFindings); err != nil {
+			slog.Error("extended export failed", "error", err)
+			os.Exit(1)
+		}
+	}
+	if *exportNDJSON != "" {
+		if err := analyzer.ExportNDJSON(*exportNDJSON); err != nil {
+			slog.Error("NDJSON export failed", "error", err)
+			os.Exit(1)
+		}
+	}
 	if *exportCSV != "" {
 		if err := analyzer.ExportToCSV(*exportCSV); err != nil {
 			slog.Error("error exporting to CSV", "error", err)
