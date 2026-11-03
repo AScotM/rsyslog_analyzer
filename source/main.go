@@ -70,6 +70,43 @@ var (
 	}
 )
 
+var cosmicTheme = "cosmos"
+var cosmicEnabled = true
+
+func cosmic(code, value string) string {
+	if !cosmicEnabled || cosmicTheme == "none" {
+		return value
+	}
+	return "\x1b[" + code + "m" + value + "\x1b[0m"
+}
+
+func cosmicHeader(value string) string { return cosmic("1;38;2;181;135;255", value) }
+func cosmicLabel(value string) string  { return cosmic("38;2;91;206;250", value) }
+func cosmicAccent(value string) string { return cosmic("1;38;2;255;121;198", value) }
+func cosmicValue(value string) string  { return cosmic("38;2;166;227;161", value) }
+func cosmicMuted(value string) string  { return cosmic("38;2;139;151;180", value) }
+func cosmicSeverity(value string) string {
+	switch strings.ToLower(value) {
+	case "critical", "fatal", "emergency", "alert":
+		return cosmic("1;38;2;255;85;119", value)
+	case "error", "err", "high":
+		return cosmic("1;38;2;255;110;145", value)
+	case "warning", "warn", "medium":
+		return cosmic("1;38;2;255;190;92", value)
+	case "info", "notice", "low":
+		return cosmic("38;2;103;232;249", value)
+	case "debug":
+		return cosmic("38;2;168;150;255", value)
+	default:
+		return cosmicValue(value)
+	}
+}
+
+func cosmicService(value string, index int) string {
+	shades := []string{"38;2;137;180;250", "38;2;203;166;247", "38;2;148;226;213", "38;2;250;179;135", "38;2;249;161;203"}
+	return cosmic(shades[index%len(shades)], value)
+}
+
 type SecurityError struct {
 	Message string
 }
@@ -1276,7 +1313,7 @@ func (r *RSyslogAnalyzer) DisplaySystemInfo() {
 }
 
 func (r *RSyslogAnalyzer) displayColorSystemInfo(parserInfo map[string]interface{}) {
-	fmt.Println("\n=== System Information ===")
+	fmt.Println(cosmicHeader("\n=== System Information ==="))
 	fmt.Printf("Patterns loaded: %v\n", parserInfo["patterns_loaded"])
 	fmt.Printf("Pattern types: %v\n", strings.Join(parserInfo["pattern_types"].([]string), ", "))
 	fmt.Printf("RSyslog detected: %v\n", parserInfo["rsyslog_detected"])
@@ -1332,7 +1369,7 @@ func (r *RSyslogAnalyzer) DisplayTree() {
 	}
 
 	if r.Config.ColorOutput {
-		fmt.Println("\n=== Syslog Analysis Tree ===")
+		fmt.Println(cosmicHeader("\n=== Syslog Analysis Tree ==="))
 	} else {
 		fmt.Println("Syslog Analysis Tree")
 		fmt.Println(strings.Repeat("=", 50))
@@ -1342,7 +1379,7 @@ func (r *RSyslogAnalyzer) DisplayTree() {
 	sort.Strings(dates)
 
 	for _, date := range dates {
-		fmt.Printf("\n%s\n", date)
+		fmt.Printf("\n%s\n", cosmicAccent(date))
 		services := tree[date]
 
 		serviceNames := make([]string, 0, len(services))
@@ -1369,7 +1406,7 @@ func (r *RSyslogAnalyzer) DisplayTree() {
 			if i == len(serviceNames)-1 {
 				connector = "└── "
 			}
-			fmt.Printf("%s%s\n", connector, serviceDisplay)
+			fmt.Printf("%s%s\n", cosmicMuted(connector), cosmicService(serviceDisplay, i))
 			r.displayServiceLogs(logs, i == len(serviceNames)-1)
 		}
 	}
@@ -1498,15 +1535,15 @@ func (r *RSyslogAnalyzer) displayLogEntry(log *LogEntry, prefix string, isLast b
 func (r *RSyslogAnalyzer) getStyleForLog(log *LogEntry) string {
 	if log.Level != "" {
 		levelStyles := map[string]string{
-			"ERROR":    "\033[31m",
-			"ERR":      "\033[31m",
-			"FATAL":    "\033[1;31m",
-			"WARN":     "\033[33m",
-			"WARNING":  "\033[33m",
-			"INFO":     "\033[32m",
-			"DEBUG":    "\033[34m",
-			"CRIT":     "\033[1;31m",
-			"CRITICAL": "\033[1;31m",
+			"ERROR":    "\033[38;2;255;110;145m",
+			"ERR":      "\033[38;2;255;110;145m",
+			"FATAL":    "\033[1;38;2;255;85;119m",
+			"WARN":     "\033[38;2;255;190;92m",
+			"WARNING":  "\033[38;2;255;190;92m",
+			"INFO":     "\033[38;2;166;227;161m",
+			"DEBUG":    "\033[38;2;168;150;255m",
+			"CRIT":     "\033[1;38;2;255;85;119m",
+			"CRITICAL": "\033[1;38;2;255;85;119m",
 		}
 		if style, ok := levelStyles[strings.ToUpper(log.Level)]; ok {
 			return style
@@ -1517,7 +1554,7 @@ func (r *RSyslogAnalyzer) getStyleForLog(log *LogEntry) string {
 	lowerMessage := strings.ToLower(log.Message)
 	for _, indicator := range errorIndicators {
 		if strings.Contains(lowerMessage, indicator) {
-			return "\033[31m"
+			return "\033[38;2;255;110;145m"
 		}
 	}
 
@@ -1546,12 +1583,12 @@ func (r *RSyslogAnalyzer) DisplaySummary() {
 }
 
 func (r *RSyslogAnalyzer) displayColorSummary() {
-	fmt.Println("\n=== Log Analysis Summary ===")
+	fmt.Println(cosmicHeader("\n=== Log Analysis Summary ==="))
 	fmt.Printf("Total entries: %d\n", r.AnalysisResults.TotalEntries)
 	fmt.Printf("Unique services: %d\n", len(r.AnalysisResults.UniqueServices))
 	fmt.Printf("Date range: %s to %s\n", r.AnalysisResults.DateRange[0], r.AnalysisResults.DateRange[1])
 	fmt.Printf("Days with logs: %d\n", len(r.Tree.GetDates()))
-	fmt.Printf("Error count: %d\n", r.AnalysisResults.ErrorCount)
+	fmt.Printf("%s %s\n", cosmicLabel("Error count:"), cosmicSeverity(strconv.Itoa(r.AnalysisResults.ErrorCount)))
 
 	topServices := make([]struct {
 		Service string
@@ -1594,7 +1631,7 @@ func (r *RSyslogAnalyzer) displayColorSummary() {
 			return levels[i].Count > levels[j].Count
 		})
 		for _, level := range levels {
-			fmt.Printf("  %s: %d\n", level.Level, level.Count)
+			fmt.Printf("  %s: %s\n", cosmicSeverity(level.Level), cosmicValue(strconv.Itoa(level.Count)))
 		}
 	}
 
@@ -1971,7 +2008,7 @@ func (r *RSyslogAnalyzer) DisplayExtendedStatistics() {
 		{"Message Lengths", stats.MessageLengths},
 	}
 	for _, group := range groups {
-		fmt.Printf("\n%s\n", group.name)
+		fmt.Printf("\n%s\n", cosmicHeader(group.name))
 		keys := sortedCounts(group.counts)
 		if len(keys) > 15 {
 			keys = keys[:15]
@@ -1986,7 +2023,7 @@ func (r *RSyslogAnalyzer) DisplayFindings(limit int) {
 	findings := r.DetectFindings(limit)
 	fmt.Printf("\nRule-based findings (up to %d, retained entries only): %d\n", limit, len(findings))
 	for _, f := range findings {
-		fmt.Printf("%s %-9s %-26s %-20s %s\n", f.Timestamp, f.Severity, f.Rule, f.Service, f.Message)
+		fmt.Printf("%s %-9s %-26s %-20s %s\n", cosmicMuted(f.Timestamp), cosmicSeverity(f.Severity), cosmicAccent(f.Rule), cosmicLabel(f.Service), f.Message)
 	}
 }
 
@@ -2037,6 +2074,7 @@ func main() {
 		wrapLines             = flag.Bool("wrap-lines", false, "Wrap long messages across lines.")
 		maxLinesPerService    = flag.Int("max-lines-per-service", 5, "Maximum lines to show per service (default: 5).")
 		noColor               = flag.Bool("no-color", false, "Disable colored output.")
+		colorTheme            = flag.String("color-theme", "cosmos", "Terminal color theme: cosmos or none.")
 		verbose               = flag.Bool("verbose", false, "Enable verbose output.")
 		summary               = flag.Bool("summary", false, "Show summary statistics.")
 		systemInfo            = flag.Bool("system-info", false, "Display system and parser information.")
@@ -2068,6 +2106,12 @@ func main() {
 	)
 
 	flag.Parse()
+	if *colorTheme != "cosmos" && *colorTheme != "none" {
+		fmt.Fprintln(os.Stderr, "invalid color theme: choose cosmos or none")
+		os.Exit(2)
+	}
+	cosmicTheme = *colorTheme
+	cosmicEnabled = !*noColor && *colorTheme != "none" && os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb"
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(logger)
@@ -2097,6 +2141,7 @@ func main() {
 		config.UseRSyslogDetection = !*noRSyslogDetection
 	}
 
+	config.ColorOutput = config.ColorOutput && cosmicEnabled
 	config.EnableAnalysis = config.EnableAnalysis || *summary || *export != ""
 	if err := config.Validate(); err != nil {
 		slog.Error("invalid configuration", "error", err)
@@ -2702,11 +2747,11 @@ func BuildIntelligence(entries []*LogEntry, minutes, threshold int) Intelligence
 }
 
 func PrintIntelligence(report IntelligenceReport, top int) {
-	fmt.Println("\nRSYSLOG FORENSIC INTELLIGENCE")
-	fmt.Println(strings.Repeat("=", 70))
+	fmt.Println(cosmicHeader("\nRSYSLOG FORENSIC INTELLIGENCE"))
+	fmt.Println(cosmicMuted(strings.Repeat("=", 70)))
 	fmt.Printf("Retained entries: %d\nFirst: %s\nLast: %s\nFingerprint: %s\nDuplicate lines: %d\n", report.Retained, report.First, report.Last, report.Fingerprint, report.DuplicateLines)
 	printSeries := func(title string, series []IntelligenceSeries) {
-		fmt.Println("\n" + title)
+		fmt.Println(cosmicHeader("\n" + title))
 		limit := top
 		if len(series) < limit {
 			limit = len(series)
@@ -2718,17 +2763,17 @@ func PrintIntelligence(report IntelligenceReport, top int) {
 	printSeries("TOP SERVICES", report.Services)
 	printSeries("TOP HOSTS", report.Hosts)
 	printSeries("MESSAGE PATTERNS", report.Patterns)
-	fmt.Println("\nAUTHENTICATION")
+	fmt.Println(cosmicHeader("\nAUTHENTICATION"))
 	for _, key := range []string{"failure", "success", "lockout", "disconnect"} {
 		fmt.Printf("  %-16s %d\n", key, report.Authentication[key])
 	}
-	fmt.Println("\nCORRELATED EVENTS")
+	fmt.Println(cosmicHeader("\nCORRELATED EVENTS"))
 	limit := len(report.Events)
 	if limit > top {
 		limit = top
 	}
 	for _, event := range report.Events[:limit] {
-		fmt.Printf("  %-26s %-22s count=%d subject=%s\n", event.Category, event.Severity, event.Count, event.Subject)
+		fmt.Printf("  %s %s count=%s subject=%s\n", cosmicAccent(event.Category), cosmicSeverity(event.Severity), cosmicValue(strconv.Itoa(event.Count)), cosmicLabel(event.Subject))
 	}
 	fmt.Printf("\nInterarrival mean: %.3fs median: %.3fs p95: %.3fs\n", report.InterarrivalSeconds["mean"], report.InterarrivalSeconds["median"], report.InterarrivalSeconds["p95"])
 }
