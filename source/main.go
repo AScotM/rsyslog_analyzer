@@ -5,13 +5,16 @@ import (
 	"compress/bzip2"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -654,7 +657,12 @@ type decompressionLimitReader struct {
 
 func (d *decompressionLimitReader) Read(p []byte) (int, error) {
 	if d.remaining <= 0 {
-		return 0, errors.New("decompressed data exceeds configured safety limit")
+		var probe [1]byte
+		n, err := d.r.Read(probe[:])
+		if n > 0 {
+			return 0, errors.New("decompressed data exceeds configured safety limit")
+		}
+		return 0, err
 	}
 	if int64(len(p)) > d.remaining {
 		p = p[:d.remaining]
@@ -783,6 +791,15 @@ func (l *LogParser) parseIsoTimestamp(tsStr string) (*time.Time, error) {
 }
 
 func (l *LogParser) ParseLine(line string, now, cutoffDate time.Time) (*LogEntry, error) {
+	if entry, matched, err := parseRFC5424(line); matched {
+		if err != nil {
+			return nil, err
+		}
+		if entry.Timestamp.Before(cutoffDate) || entry.Timestamp.After(now.Add(24*time.Hour)) {
+			return nil, errors.New("timestamp out of range")
+		}
+		return entry, nil
+	}
 	if !l.isLikelyLogLine(line) {
 		return nil, errors.New("not a log line")
 	}
@@ -1133,7 +1150,7 @@ func (r *RSyslogAnalyzer) openLogFile(ctx context.Context, filePath string) (io.
 		}, nil
 	}
 
-	return file, nil
+	return &compositeReadCloser{reader: &decompressionLimitReader{r: file, remaining: maxDecompressedBytes}, closers: []io.Closer{file}}, nil
 }
 
 func (r *RSyslogAnalyzer) LoadLogs() error {
@@ -2013,34 +2030,41 @@ func (r *RSyslogAnalyzer) ExportNDJSON(filename string) error {
 
 func main() {
 	var (
-		logFile            = flag.String("log-file", "", "Path to the syslog file (overrides default search).")
-		maxDays            = flag.Int("max-days", 30, "Maximum days of logs to keep (default: 30).")
-		truncateLength     = flag.Int("truncate-length", 80, "Length to truncate messages (default: 80).")
-		showFullLines      = flag.Bool("show-full-lines", false, "Show full log messages without truncation.")
-		wrapLines          = flag.Bool("wrap-lines", false, "Wrap long messages across lines.")
-		maxLinesPerService = flag.Int("max-lines-per-service", 5, "Maximum lines to show per service (default: 5).")
-		noColor            = flag.Bool("no-color", false, "Disable colored output.")
-		verbose            = flag.Bool("verbose", false, "Enable verbose output.")
-		summary            = flag.Bool("summary", false, "Show summary statistics.")
-		systemInfo         = flag.Bool("system-info", false, "Display system and parser information.")
-		enableAnalysis     = flag.Bool("enable-analysis", false, "Enable detailed log analysis.")
-		export             = flag.String("export", "", "Export analysis results to JSON file.")
-		exportCSV          = flag.String("export-csv", "", "Export log data to CSV file.")
-		findErrors         = flag.Bool("find-errors", false, "Find and display error logs.")
-		service            = flag.String("service", "", "Filter by specific service name.")
-		filterService      = flag.String("filter-service", "", "Filter by service name pattern (regex).")
-		filterLevel        = flag.String("filter-level", "", "Filter by log level.")
-		filterMessage      = flag.String("filter-message", "", "Filter by message content.")
-		maxFileSize        = flag.Int("max-file-size", 100, "Maximum file size in MB (default: 100).")
-		maxMemoryEntries   = flag.Int("max-memory-entries", 100000, "Maximum log entries to keep in memory (default: 100000).")
-		noRSyslogDetection = flag.Bool("no-rsyslog-detection", false, "Disable rsyslog capability detection.")
-		configFile         = flag.String("config-file", "", "Load configuration from JSON file.")
-		showVersion        = flag.Bool("version", false, "Show version information.")
-		extended           = flag.Bool("extended-stats", false, "Show extended retained-entry statistics.")
-		findings           = flag.Bool("findings", false, "Show rule-based diagnostic findings.")
-		maxFindings        = flag.Int("max-findings", 100, "Maximum number of findings to report.")
-		exportExtended     = flag.String("export-extended", "", "Export extended analysis JSON.")
-		exportNDJSON       = flag.String("export-ndjson", "", "Export retained entries as NDJSON.")
+		logFile               = flag.String("log-file", "", "Path to the syslog file (overrides default search).")
+		maxDays               = flag.Int("max-days", 30, "Maximum days of logs to keep (default: 30).")
+		truncateLength        = flag.Int("truncate-length", 80, "Length to truncate messages (default: 80).")
+		showFullLines         = flag.Bool("show-full-lines", false, "Show full log messages without truncation.")
+		wrapLines             = flag.Bool("wrap-lines", false, "Wrap long messages across lines.")
+		maxLinesPerService    = flag.Int("max-lines-per-service", 5, "Maximum lines to show per service (default: 5).")
+		noColor               = flag.Bool("no-color", false, "Disable colored output.")
+		verbose               = flag.Bool("verbose", false, "Enable verbose output.")
+		summary               = flag.Bool("summary", false, "Show summary statistics.")
+		systemInfo            = flag.Bool("system-info", false, "Display system and parser information.")
+		enableAnalysis        = flag.Bool("enable-analysis", false, "Enable detailed log analysis.")
+		export                = flag.String("export", "", "Export analysis results to JSON file.")
+		exportCSV             = flag.String("export-csv", "", "Export log data to CSV file.")
+		findErrors            = flag.Bool("find-errors", false, "Find and display error logs.")
+		service               = flag.String("service", "", "Filter by specific service name.")
+		filterService         = flag.String("filter-service", "", "Filter by service name pattern (regex).")
+		filterLevel           = flag.String("filter-level", "", "Filter by log level.")
+		filterMessage         = flag.String("filter-message", "", "Filter by message content.")
+		maxFileSize           = flag.Int("max-file-size", 100, "Maximum file size in MB (default: 100).")
+		maxMemoryEntries      = flag.Int("max-memory-entries", 100000, "Maximum log entries to keep in memory (default: 100000).")
+		noRSyslogDetection    = flag.Bool("no-rsyslog-detection", false, "Disable rsyslog capability detection.")
+		configFile            = flag.String("config-file", "", "Load configuration from JSON file.")
+		showVersion           = flag.Bool("version", false, "Show version information.")
+		extended              = flag.Bool("extended-stats", false, "Show extended retained-entry statistics.")
+		findings              = flag.Bool("findings", false, "Show rule-based diagnostic findings.")
+		maxFindings           = flag.Int("max-findings", 100, "Maximum number of findings to report.")
+		exportExtended        = flag.String("export-extended", "", "Export extended analysis JSON.")
+		exportNDJSON          = flag.String("export-ndjson", "", "Export retained entries as NDJSON.")
+		intelligence          = flag.Bool("intelligence", false, "Show retained-entry forensic intelligence report.")
+		intelligenceJSON      = flag.String("intelligence-json", "", "Export retained-entry intelligence as JSON.")
+		intelligenceTop       = flag.Int("intelligence-top", 20, "Maximum intelligence table rows.")
+		intelligenceWindow    = flag.Int("intelligence-window", 10, "Correlation window in minutes.")
+		intelligenceThreshold = flag.Int("intelligence-threshold", 5, "Authentication attempts threshold per window.")
+		baseline              = flag.String("baseline", "", "Compare intelligence snapshot to baseline JSON.")
+		writeBaseline         = flag.String("write-baseline", "", "Write current intelligence baseline JSON.")
 	)
 
 	flag.Parse()
@@ -2049,7 +2073,7 @@ func main() {
 	slog.SetDefault(logger)
 
 	if *showVersion {
-		fmt.Println("RSyslogAnalyzer 5.0.0")
+		fmt.Println("RSyslogAnalyzer 6.0.0")
 		return
 	}
 
@@ -2176,6 +2200,37 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	if *intelligence || *intelligenceJSON != "" || *baseline != "" || *writeBaseline != "" {
+		if *intelligenceTop < 1 || *intelligenceWindow < 1 || *intelligenceThreshold < 1 {
+			slog.Error("invalid intelligence limits")
+			os.Exit(2)
+		}
+		intelligenceReport := BuildIntelligence(analyzer.storage.GetAll(), *intelligenceWindow, *intelligenceThreshold)
+		if *intelligence {
+			PrintIntelligence(intelligenceReport, *intelligenceTop)
+		}
+		if *intelligenceJSON != "" {
+			if err := WriteIntelligence(*intelligenceJSON, intelligenceReport); err != nil {
+				slog.Error("intelligence export failed", "error", err)
+				os.Exit(1)
+			}
+		}
+		if *writeBaseline != "" {
+			if err := WriteIntelligence(*writeBaseline, intelligenceReport); err != nil {
+				slog.Error("baseline write failed", "error", err)
+				os.Exit(1)
+			}
+		}
+		if *baseline != "" {
+			diff, err := CompareIntelligence(*baseline, intelligenceReport)
+			if err != nil {
+				slog.Error("baseline comparison failed", "error", err)
+				os.Exit(1)
+			}
+			data, _ := json.MarshalIndent(diff, "", "  ")
+			fmt.Println(string(data))
+		}
+	}
 	if *exportCSV != "" {
 		if err := analyzer.ExportToCSV(*exportCSV); err != nil {
 			slog.Error("error exporting to CSV", "error", err)
@@ -2183,4 +2238,583 @@ func main() {
 			slog.Info("exported log data to CSV", "file", *exportCSV)
 		}
 	}
+}
+
+type RFC5424Fields struct {
+	Priority       int    `json:"priority"`
+	Facility       int    `json:"facility"`
+	Severity       int    `json:"severity"`
+	Version        int    `json:"version"`
+	Timestamp      string `json:"timestamp"`
+	Host           string `json:"host"`
+	App            string `json:"app"`
+	Process        string `json:"process"`
+	MessageID      string `json:"message_id"`
+	StructuredData string `json:"structured_data"`
+	Message        string `json:"message"`
+}
+
+func readRFC5424Token(input string, cursor *int) (string, error) {
+	start := *cursor
+	for *cursor < len(input) && input[*cursor] != ' ' {
+		*cursor++
+	}
+	if start == *cursor {
+		return "", errors.New("empty RFC5424 header field")
+	}
+	value := input[start:*cursor]
+	if *cursor < len(input) {
+		*cursor++
+	}
+	return value, nil
+}
+
+func readRFC5424Structured(input string, cursor *int) (string, error) {
+	if *cursor >= len(input) {
+		return "", errors.New("missing structured data")
+	}
+	if input[*cursor] == '-' {
+		*cursor++
+		return "-", nil
+	}
+	start := *cursor
+	for *cursor < len(input) && input[*cursor] == '[' {
+		*cursor++
+		quote := false
+		escaped := false
+		closed := false
+		for *cursor < len(input) {
+			c := input[*cursor]
+			*cursor++
+			if escaped {
+				escaped = false
+				continue
+			}
+			if quote && c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				quote = !quote
+				continue
+			}
+			if c == ']' && !quote {
+				closed = true
+				break
+			}
+		}
+		if !closed {
+			return "", errors.New("unterminated RFC5424 structured data")
+		}
+	}
+	if start == *cursor {
+		return "", errors.New("invalid structured data")
+	}
+	return input[start:*cursor], nil
+}
+
+func parseRFC5424(line string) (*LogEntry, bool, error) {
+	if !strings.HasPrefix(line, "<") {
+		return nil, false, nil
+	}
+	end := strings.IndexByte(line, '>')
+	if end < 2 || end > 4 {
+		return nil, false, nil
+	}
+	priority, err := strconv.Atoi(line[1:end])
+	if err != nil || priority < 0 || priority > 191 {
+		return nil, false, nil
+	}
+	cursor := end + 1
+	version, err := readRFC5424Token(line, &cursor)
+	if err != nil {
+		return nil, true, err
+	}
+	if version != "1" {
+		return nil, false, nil
+	}
+	timestamp, err := readRFC5424Token(line, &cursor)
+	if err != nil {
+		return nil, true, err
+	}
+	host, err := readRFC5424Token(line, &cursor)
+	if err != nil {
+		return nil, true, err
+	}
+	app, err := readRFC5424Token(line, &cursor)
+	if err != nil {
+		return nil, true, err
+	}
+	process, err := readRFC5424Token(line, &cursor)
+	if err != nil {
+		return nil, true, err
+	}
+	_, err = readRFC5424Token(line, &cursor)
+	if err != nil {
+		return nil, true, err
+	}
+	_, err = readRFC5424Structured(line, &cursor)
+	if err != nil {
+		return nil, true, err
+	}
+	message := ""
+	if cursor < len(line) {
+		if line[cursor] != ' ' {
+			return nil, true, errors.New("invalid RFC5424 message separator")
+		}
+		message = line[cursor+1:]
+	}
+	if timestamp == "-" {
+		return nil, true, errors.New("RFC5424 timestamp unavailable")
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, timestamp)
+	if err != nil {
+		return nil, true, fmt.Errorf("invalid RFC5424 timestamp: %w", err)
+	}
+	severity := []string{"EMERG", "ALERT", "CRITICAL", "ERROR", "WARNING", "NOTICE", "INFO", "DEBUG"}[priority%8]
+	if app == "-" {
+		app = "unknown"
+	}
+	if host == "-" {
+		host = "unknown"
+	}
+	if process == "-" {
+		process = ""
+	}
+	return &LogEntry{Timestamp: parsed, Host: host, Service: app, PID: process, Level: severity, Message: message, RawLine: line}, true, nil
+}
+
+type IntelligenceEvent struct {
+	Time     string   `json:"time"`
+	Category string   `json:"category"`
+	Severity string   `json:"severity"`
+	Subject  string   `json:"subject"`
+	Count    int      `json:"count"`
+	Evidence []string `json:"evidence"`
+}
+
+type IntelligenceSeries struct {
+	Key    string `json:"key"`
+	Count  int    `json:"count"`
+	Errors int    `json:"errors"`
+	First  string `json:"first"`
+	Last   string `json:"last"`
+}
+
+type IntelligenceReport struct {
+	Schema              string               `json:"schema"`
+	GeneratedUTC        string               `json:"generated_utc"`
+	Retained            int                  `json:"retained_entries"`
+	First               string               `json:"first"`
+	Last                string               `json:"last"`
+	Fingerprint         string               `json:"fingerprint"`
+	Services            []IntelligenceSeries `json:"services"`
+	Hosts               []IntelligenceSeries `json:"hosts"`
+	Hours               []IntelligenceSeries `json:"hours"`
+	Days                []IntelligenceSeries `json:"days"`
+	Patterns            []IntelligenceSeries `json:"patterns"`
+	Events              []IntelligenceEvent  `json:"events"`
+	Authentication      map[string]int       `json:"authentication"`
+	SourceIPs           map[string]int       `json:"source_ips"`
+	Severity            map[string]int       `json:"severity"`
+	ServiceTransitions  map[string]int       `json:"service_transitions"`
+	DuplicateLines      int                  `json:"duplicate_lines"`
+	InterarrivalSeconds map[string]float64   `json:"interarrival_seconds"`
+	WindowMinutes       int                  `json:"window_minutes"`
+	Threshold           int                  `json:"threshold"`
+}
+
+func NormalizeMessage(message string) string {
+	message = strings.ToLower(message)
+	message = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`).ReplaceAllString(message, "<ip>")
+	message = regexp.MustCompile(`\b0x[0-9a-f]+\b`).ReplaceAllString(message, "<hex>")
+	message = regexp.MustCompile(`\b[0-9a-f]{12,}\b`).ReplaceAllString(message, "<id>")
+	message = regexp.MustCompile(`\b\d+\b`).ReplaceAllString(message, "<num>")
+	message = strings.Join(strings.Fields(message), " ")
+	if len(message) > 180 {
+		message = message[:180]
+	}
+	return message
+}
+
+func ExtractSourceIP(message string) string {
+	patterns := []string{`(?i)\bfrom\s+([0-9a-fA-F:.]+)\b`, `(?i)\brhost=([0-9a-fA-F:.]+)\b`, `(?i)\bsrc(?:_ip)?=([0-9a-fA-F:.]+)\b`}
+	for _, pattern := range patterns {
+		match := regexp.MustCompile(pattern).FindStringSubmatch(message)
+		if len(match) < 2 {
+			continue
+		}
+		address := net.ParseIP(strings.Trim(match[1], "[]"))
+		if address != nil {
+			return address.String()
+		}
+	}
+	return ""
+}
+
+func SeriesFromEntries(entries []*LogEntry, key func(*LogEntry) string) []IntelligenceSeries {
+	index := map[string]*IntelligenceSeries{}
+	for _, entry := range entries {
+		name := key(entry)
+		if name == "" {
+			name = "unknown"
+		}
+		item := index[name]
+		if item == nil {
+			item = &IntelligenceSeries{Key: name}
+			index[name] = item
+		}
+		item.Count++
+		if entry.IsError() {
+			item.Errors++
+		}
+		stamp := entry.Timestamp.UTC().Format(time.RFC3339)
+		if item.First == "" || stamp < item.First {
+			item.First = stamp
+		}
+		if stamp > item.Last {
+			item.Last = stamp
+		}
+	}
+	result := make([]IntelligenceSeries, 0, len(index))
+	for _, item := range index {
+		result = append(result, *item)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Count == result[j].Count {
+			return result[i].Key < result[j].Key
+		}
+		return result[i].Count > result[j].Count
+	})
+	return result
+}
+
+func AuthenticationCategory(entry *LogEntry) string {
+	text := strings.ToLower(entry.Message)
+	switch {
+	case strings.Contains(text, "failed password"), strings.Contains(text, "authentication failure"), strings.Contains(text, "invalid user"), strings.Contains(text, "pam_unix") && strings.Contains(text, "failure"):
+		return "failure"
+	case strings.Contains(text, "accepted password"), strings.Contains(text, "accepted publickey"), strings.Contains(text, "session opened"):
+		return "success"
+	case strings.Contains(text, "maximum authentication attempts"), strings.Contains(text, "too many authentication failures"):
+		return "lockout"
+	case strings.Contains(text, "connection closed by authenticating user"):
+		return "disconnect"
+	}
+	return ""
+}
+
+func ServiceTransition(entry *LogEntry) string {
+	text := strings.ToLower(entry.Message)
+	switch {
+	case strings.Contains(text, "started "), strings.Contains(text, "entered running state"):
+		return "started"
+	case strings.Contains(text, "stopped "), strings.Contains(text, "deactivated successfully"):
+		return "stopped"
+	case strings.Contains(text, "failed to start"), strings.Contains(text, "entered failed state"), strings.Contains(text, "main process exited"):
+		return "failed"
+	case strings.Contains(text, "scheduled restart job"), strings.Contains(text, "restart counter is"):
+		return "restarting"
+	}
+	return ""
+}
+
+func CalculateInterarrival(entries []*LogEntry) map[string]float64 {
+	ordered := append([]*LogEntry(nil), entries...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Timestamp.Before(ordered[j].Timestamp) })
+	intervals := make([]float64, 0, len(ordered))
+	for i := 1; i < len(ordered); i++ {
+		gap := ordered[i].Timestamp.Sub(ordered[i-1].Timestamp).Seconds()
+		if gap >= 0 {
+			intervals = append(intervals, gap)
+		}
+	}
+	result := map[string]float64{"count": float64(len(intervals)), "min": 0, "max": 0, "mean": 0, "median": 0, "p95": 0}
+	if len(intervals) == 0 {
+		return result
+	}
+	sort.Float64s(intervals)
+	total := 0.0
+	for _, gap := range intervals {
+		total += gap
+	}
+	result["min"] = intervals[0]
+	result["max"] = intervals[len(intervals)-1]
+	result["mean"] = total / float64(len(intervals))
+	result["median"] = intervals[len(intervals)/2]
+	result["p95"] = intervals[int(float64(len(intervals)-1)*0.95)]
+	return result
+}
+
+func DetectAuthenticationBursts(entries []*LogEntry, minutes, threshold int) []IntelligenceEvent {
+	groups := map[string][]*LogEntry{}
+	for _, entry := range entries {
+		if AuthenticationCategory(entry) != "failure" {
+			continue
+		}
+		source := ExtractSourceIP(entry.Message)
+		if source == "" {
+			source = "unknown-source@" + entry.Host
+		}
+		groups[source] = append(groups[source], entry)
+	}
+	events := []IntelligenceEvent{}
+	for source, group := range groups {
+		sort.Slice(group, func(i, j int) bool { return group[i].Timestamp.Before(group[j].Timestamp) })
+		left := 0
+		best := 0
+		bestEnd := 0
+		for right := range group {
+			for left <= right && group[right].Timestamp.Sub(group[left].Timestamp) > time.Duration(minutes)*time.Minute {
+				left++
+			}
+			count := right - left + 1
+			if count > best {
+				best = count
+				bestEnd = right
+			}
+		}
+		if best >= threshold {
+			evidence := []string{}
+			begin := bestEnd - best + 1
+			for i := begin; i <= bestEnd && len(evidence) < 3; i++ {
+				evidence = append(evidence, group[i].Timestamp.Format(time.RFC3339)+" "+group[i].Service)
+			}
+			events = append(events, IntelligenceEvent{Time: group[bestEnd].Timestamp.UTC().Format(time.RFC3339), Category: "authentication-burst", Severity: "high", Subject: source, Count: best, Evidence: evidence})
+		}
+	}
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].Count == events[j].Count {
+			return events[i].Subject < events[j].Subject
+		}
+		return events[i].Count > events[j].Count
+	})
+	return events
+}
+
+func DetectServiceFailures(entries []*LogEntry, threshold int) []IntelligenceEvent {
+	groups := map[string][]*LogEntry{}
+	for _, entry := range entries {
+		if ServiceTransition(entry) == "failed" {
+			groups[entry.Service] = append(groups[entry.Service], entry)
+		}
+	}
+	events := []IntelligenceEvent{}
+	for service, group := range groups {
+		if len(group) < threshold {
+			continue
+		}
+		sort.Slice(group, func(i, j int) bool { return group[i].Timestamp.Before(group[j].Timestamp) })
+		evidence := []string{}
+		for _, entry := range group {
+			if len(evidence) >= 3 {
+				break
+			}
+			evidence = append(evidence, entry.Message)
+		}
+		events = append(events, IntelligenceEvent{Time: group[len(group)-1].Timestamp.UTC().Format(time.RFC3339), Category: "repeated-service-failure", Severity: "medium", Subject: service, Count: len(group), Evidence: evidence})
+	}
+	sort.Slice(events, func(i, j int) bool { return events[i].Count > events[j].Count })
+	return events
+}
+
+func DetectVolumeSpikes(entries []*LogEntry, threshold int) []IntelligenceEvent {
+	counts := map[string]int{}
+	for _, entry := range entries {
+		counts[entry.Timestamp.UTC().Format("2006-01-02T15:04")+" "+entry.Service]++
+	}
+	events := []IntelligenceEvent{}
+	for key, count := range counts {
+		if count >= threshold {
+			events = append(events, IntelligenceEvent{Time: key[:16] + ":00Z", Category: "minute-volume-spike", Severity: "info", Subject: key[17:], Count: count})
+		}
+	}
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].Count == events[j].Count {
+			return events[i].Time < events[j].Time
+		}
+		return events[i].Count > events[j].Count
+	})
+	if len(events) > 100 {
+		events = events[:100]
+	}
+	return events
+}
+
+func BuildIntelligence(entries []*LogEntry, minutes, threshold int) IntelligenceReport {
+	report := IntelligenceReport{Schema: "rsyslog-analyzer-intelligence-v1", GeneratedUTC: time.Now().UTC().Format(time.RFC3339), Retained: len(entries), Authentication: map[string]int{}, SourceIPs: map[string]int{}, Severity: map[string]int{}, ServiceTransitions: map[string]int{}, WindowMinutes: minutes, Threshold: threshold}
+	ordered := append([]*LogEntry(nil), entries...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].Timestamp.Equal(ordered[j].Timestamp) {
+			return ordered[i].RawLine < ordered[j].RawLine
+		}
+		return ordered[i].Timestamp.Before(ordered[j].Timestamp)
+	})
+	digest := sha256.New()
+	seen := map[string]struct{}{}
+	for _, entry := range ordered {
+		stamp := entry.Timestamp.UTC().Format(time.RFC3339Nano)
+		digest.Write([]byte(stamp + "\x00" + entry.RawLine + "\n"))
+		if _, ok := seen[entry.RawLine]; ok {
+			report.DuplicateLines++
+		} else {
+			seen[entry.RawLine] = struct{}{}
+		}
+		if auth := AuthenticationCategory(entry); auth != "" {
+			report.Authentication[auth]++
+		}
+		if ip := ExtractSourceIP(entry.Message); ip != "" {
+			report.SourceIPs[ip]++
+		}
+		if transition := ServiceTransition(entry); transition != "" {
+			report.ServiceTransitions[transition]++
+		}
+		level := strings.ToUpper(entry.Level)
+		if level == "" {
+			level = "UNSPECIFIED"
+		}
+		report.Severity[level]++
+	}
+	report.Fingerprint = hex.EncodeToString(digest.Sum(nil))
+	if len(ordered) > 0 {
+		report.First = ordered[0].Timestamp.UTC().Format(time.RFC3339Nano)
+		report.Last = ordered[len(ordered)-1].Timestamp.UTC().Format(time.RFC3339Nano)
+	}
+	report.Services = SeriesFromEntries(ordered, func(e *LogEntry) string { return e.Service })
+	report.Hosts = SeriesFromEntries(ordered, func(e *LogEntry) string { return e.Host })
+	report.Hours = SeriesFromEntries(ordered, func(e *LogEntry) string { return e.Timestamp.UTC().Format("2006-01-02T15") })
+	report.Days = SeriesFromEntries(ordered, func(e *LogEntry) string { return e.Timestamp.UTC().Format("2006-01-02") })
+	report.Patterns = SeriesFromEntries(ordered, func(e *LogEntry) string { return NormalizeMessage(e.Message) })
+	report.InterarrivalSeconds = CalculateInterarrival(ordered)
+	report.Events = append(report.Events, DetectAuthenticationBursts(ordered, minutes, threshold)...)
+	report.Events = append(report.Events, DetectServiceFailures(ordered, threshold)...)
+	report.Events = append(report.Events, DetectVolumeSpikes(ordered, threshold*3)...)
+	sort.Slice(report.Events, func(i, j int) bool {
+		if report.Events[i].Count == report.Events[j].Count {
+			return report.Events[i].Category < report.Events[j].Category
+		}
+		return report.Events[i].Count > report.Events[j].Count
+	})
+	if len(report.Events) > 500 {
+		report.Events = report.Events[:500]
+	}
+	return report
+}
+
+func PrintIntelligence(report IntelligenceReport, top int) {
+	fmt.Println("\nRSYSLOG FORENSIC INTELLIGENCE")
+	fmt.Println(strings.Repeat("=", 70))
+	fmt.Printf("Retained entries: %d\nFirst: %s\nLast: %s\nFingerprint: %s\nDuplicate lines: %d\n", report.Retained, report.First, report.Last, report.Fingerprint, report.DuplicateLines)
+	printSeries := func(title string, series []IntelligenceSeries) {
+		fmt.Println("\n" + title)
+		limit := top
+		if len(series) < limit {
+			limit = len(series)
+		}
+		for _, item := range series[:limit] {
+			fmt.Printf("  %-42s %8d errors=%d\n", item.Key, item.Count, item.Errors)
+		}
+	}
+	printSeries("TOP SERVICES", report.Services)
+	printSeries("TOP HOSTS", report.Hosts)
+	printSeries("MESSAGE PATTERNS", report.Patterns)
+	fmt.Println("\nAUTHENTICATION")
+	for _, key := range []string{"failure", "success", "lockout", "disconnect"} {
+		fmt.Printf("  %-16s %d\n", key, report.Authentication[key])
+	}
+	fmt.Println("\nCORRELATED EVENTS")
+	limit := len(report.Events)
+	if limit > top {
+		limit = top
+	}
+	for _, event := range report.Events[:limit] {
+		fmt.Printf("  %-26s %-22s count=%d subject=%s\n", event.Category, event.Severity, event.Count, event.Subject)
+	}
+	fmt.Printf("\nInterarrival mean: %.3fs median: %.3fs p95: %.3fs\n", report.InterarrivalSeconds["mean"], report.InterarrivalSeconds["median"], report.InterarrivalSeconds["p95"])
+}
+
+func WriteIntelligence(path string, report IntelligenceReport) error {
+	data, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	directory := filepath.Dir(path)
+	file, err := os.CreateTemp(directory, ".rsyslog-intelligence-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	if _, err = file.Write(data); err != nil {
+		file.Close()
+		return err
+	}
+	if err = file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err = file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), path)
+}
+
+type IntelligenceDiff struct {
+	Baseline        string              `json:"baseline"`
+	Current         string              `json:"current"`
+	Changed         bool                `json:"changed"`
+	RetainedDelta   int                 `json:"retained_delta"`
+	AddedServices   []string            `json:"added_services"`
+	RemovedServices []string            `json:"removed_services"`
+	AddedHosts      []string            `json:"added_hosts"`
+	RemovedHosts    []string            `json:"removed_hosts"`
+	NewEvents       []IntelligenceEvent `json:"new_events"`
+}
+
+func SeriesKeys(series []IntelligenceSeries) map[string]bool {
+	result := map[string]bool{}
+	for _, item := range series {
+		result[item.Key] = true
+	}
+	return result
+}
+
+func KeyDifference(left, right map[string]bool) []string {
+	result := []string{}
+	for key := range left {
+		if !right[key] {
+			result = append(result, key)
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+func CompareIntelligence(path string, current IntelligenceReport) (IntelligenceDiff, error) {
+	var previous IntelligenceReport
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return IntelligenceDiff{}, err
+	}
+	if err = json.Unmarshal(data, &previous); err != nil {
+		return IntelligenceDiff{}, err
+	}
+	if previous.Schema != "rsyslog-analyzer-intelligence-v1" {
+		return IntelligenceDiff{}, errors.New("incompatible intelligence baseline schema")
+	}
+	oldServices := SeriesKeys(previous.Services)
+	newServices := SeriesKeys(current.Services)
+	oldHosts := SeriesKeys(previous.Hosts)
+	newHosts := SeriesKeys(current.Hosts)
+	diff := IntelligenceDiff{Baseline: previous.Fingerprint, Current: current.Fingerprint, Changed: previous.Fingerprint != current.Fingerprint, RetainedDelta: current.Retained - previous.Retained, AddedServices: KeyDifference(newServices, oldServices), RemovedServices: KeyDifference(oldServices, newServices), AddedHosts: KeyDifference(newHosts, oldHosts), RemovedHosts: KeyDifference(oldHosts, newHosts), NewEvents: []IntelligenceEvent{}}
+	previousEvents := map[string]bool{}
+	for _, event := range previous.Events {
+		previousEvents[event.Category+"\x00"+event.Subject] = true
+	}
+	for _, event := range current.Events {
+		if !previousEvents[event.Category+"\x00"+event.Subject] {
+			diff.NewEvents = append(diff.NewEvents, event)
+		}
+	}
+	return diff, nil
 }
